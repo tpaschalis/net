@@ -1755,6 +1755,123 @@ func TestServer_Response_NoData_Header_FooBar(t *testing.T) {
 	})
 }
 
+// golang.org/issue/39017
+func TestServerIgnoresContentLengthSignWhenWritingChunks(t *testing.T) {
+	tests := []struct {
+		name   string
+		cl     string
+		wantCL string
+	}{
+		{
+			name:   "proper content-length",
+			cl:     "3",
+			wantCL: "3",
+		},
+		{
+			name:   "ignore cl with plus sign",
+			cl:     "+3",
+			wantCL: "0",
+		},
+		{
+			name:   "ignore cl with minus sign",
+			cl:     "-3",
+			wantCL: "0",
+		},
+		{
+			name:   "max int64, for safe uint64->int64 conversion",
+			cl:     "9223372036854775807",
+			wantCL: "9223372036854775807",
+		},
+		{
+			name:   "overflows int64, so ignored",
+			cl:     "9223372036854775808",
+			wantCL: "0",
+		},
+	}
+
+	for _, tt := range tests {
+		testServerResponse(t, func(w http.ResponseWriter, r *http.Request) error {
+			w.Header().Set("content-length", tt.cl)
+			return nil
+		}, func(st *serverTester) {
+			getSlash(st)
+			hf := st.wantHeaders()
+			if !hf.StreamEnded() {
+				t.Fatal("want END_STREAM flag")
+			}
+			if !hf.HeadersEnded() {
+				t.Fatal("want END_HEADERS flag")
+			}
+			goth := st.decodeHeader(hf.HeaderBlockFragment())
+			wanth := [][2]string{
+				{":status", "200"},
+				{"content-length", tt.wantCL}, // Since no bytes were actually written
+			}
+			if !reflect.DeepEqual(goth, wanth) {
+				t.Errorf("For case %q, value %q, got = %q; want %q", tt.name, tt.cl, goth, wanth)
+			}
+		})
+	}
+}
+
+// golang.org/issue/39017
+func TestServerRejectsContentLengthSignWhenBuildingNewRequests(t *testing.T) {
+	tests := []struct {
+		name   string
+		cl     string
+		wantCL int64
+	}{
+		{
+			name:   "proper content-length",
+			cl:     "3",
+			wantCL: 3,
+		},
+		{
+			name:   "ignore cl with plus sign",
+			cl:     "+3",
+			wantCL: 0,
+		},
+		{
+			name:   "ignore cl with minus sign",
+			cl:     "-3",
+			wantCL: 0,
+		},
+		{
+			name:   "max int64, for safe uint64->int64 conversion",
+			cl:     "9223372036854775807",
+			wantCL: 9223372036854775807,
+		},
+		{
+			name:   "overflows int64, so ignored",
+			cl:     "9223372036854775808",
+			wantCL: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		writeReq := func(st *serverTester) {
+			st.writeHeaders(HeadersFrameParam{
+				StreamID:      1, // clients send odd numbers
+				BlockFragment: st.encodeHeader("content-length", tt.cl),
+				EndStream:     false,
+				EndHeaders:    true,
+			})
+			st.writeData(1, false, []byte(""))
+			st.writeHeaders(HeadersFrameParam{
+				StreamID:      1, // clients send odd numbers
+				BlockFragment: st.encodeHeader(),
+				EndStream:     true,
+				EndHeaders:    true,
+			})
+		}
+		checkReq := func(r *http.Request) {
+			if r.ContentLength != tt.wantCL {
+				t.Errorf("For case %q, value %q, got = %d; want %d", tt.name, tt.cl, r.ContentLength, tt.wantCL)
+			}
+		}
+		testServerRequest(t, writeReq, checkReq)
+	}
+}
 func TestServer_Response_Data_Sniff_DoesntOverride(t *testing.T) {
 	const msg = "<html>this is HTML."
 	testServerResponse(t, func(w http.ResponseWriter, r *http.Request) error {
